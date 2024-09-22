@@ -1,5 +1,5 @@
 import asyncio
-import threading
+import re
 import websockets
 from flask import Flask, Response, request
 from flask_cors import CORS
@@ -8,6 +8,10 @@ import requests
 from simple_websocket import Server
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import json
+import pickledb
+
+db = pickledb.load('messages.db', True)
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -29,23 +33,36 @@ generation_args = {
     "eos_token_id": [tokenizer.eos_token_id, 32000],
 }
 
-print(torch.cuda.is_available())
 
-chat = [
-    {
-        "role": "user",
-        "content": "TRANSLATE =ils vont me traduire en français et vice versa= INTO ENGLISH",
-    }
-]
+def run_translate_prompt(prompt: str, text: str) -> str:
+    chat = [
+        {
+            "role": "user",
+            "content": f"{prompt}: \"{text}\"",
+        },
+    ]
 
-chat_input = tokenizer.apply_chat_template(
-    chat, tokenize=False, add_generation_prompt=True
-)
+    chat_input = tokenizer.apply_chat_template(
+        chat, tokenize=False, add_generation_prompt=True
+    )
 
-inputs = tokenizer(chat_input, return_tensors="pt").to(model.device)
-tokens = model.generate(**inputs, **generation_args)
+    inputs = tokenizer(chat_input, return_tensors="pt").to(model.device)
+    tokens = model.generate(**inputs, **generation_args)
 
-print(tokenizer.decode(tokens[0]))
+    raw_text = tokenizer.decode(tokens[0])
+
+    # extract the assistant's text from this
+    output = raw_text.split('assistant\n')[-1].split("<|im_end|>")[0].strip().strip("\"")
+    response = re.sub(r'^[\'"“”‘’«\s]+|[\'"“”»‘’\s.,!?]+$', '', output).strip()
+    return response
+
+
+def french_to_english(text: str) -> str:
+    return run_translate_prompt("Translate this French to English", text)
+
+
+def english_to_french(text: str) -> str:
+    return run_translate_prompt("Translate this English to French", text)
 
 # Target API base URL
 TARGET_API_DOMAIN = "qcs.shsbs.xyz"
@@ -119,7 +136,30 @@ async def server_to_client(ws: Server, websocket: websockets.WebSocketClientProt
             print("SERVER", "WAITING")
             server_message = await websocket.recv()
             print("SERVER", server_message)
-            ws.send(server_message)
+            data = json.loads(server_message)
+            msg_type = data['type']
+            try:
+                if msg_type == 'message_event' or msg_type == 'live':
+                    for index, message in enumerate(data['data']['objects']['message_event']['message']):
+                        key = f"msg-{message['id']}"
+                        if db.exists(key):
+                            message['text'] = db.get(key)
+                        else:
+                            message['text'] = english_to_french(message['text'])
+                            db.set(key, message['text'])
+                        data['data']['objects']['message_event']['message'][index] = message
+                elif msg_type == 'request' and 'message' in data['data']['objects']:
+                    for index, message in enumerate(data['data']['objects']['message']):
+                        key = f"msg-{message['id']}"
+                        if db.exists(key):
+                            message['text'] = db.get(key)
+                        else:
+                            message['text'] = english_to_french(message['text'])
+                            db.set(key, message['text'])
+                        data['data']['objects']['message'][index] = message
+            except KeyError as e:
+                print(e)
+            ws.send(json.dumps(data))
     except websockets.ConnectionClosed:
         pass  # Handle server disconnection
 
@@ -147,7 +187,6 @@ def ws_handle(ws):
     "/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
 )
 def catch_all(path):
-    print("ok:()")
     return forward_request_to_target()
 
 
